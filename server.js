@@ -598,7 +598,7 @@ const CONFIG = {
 // EXCHANGE — rate limit safe, timeout set
 // ─────────────────────────────────────────────────────────────────────────────
 
-const binance = new ccxt.binance({
+const binance = new ccxt.kucoin({
     enableRateLimit: true,
     timeout: 30000,
     options: { defaultType: 'spot' },
