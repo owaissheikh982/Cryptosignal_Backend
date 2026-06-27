@@ -253,6 +253,7 @@ function computeVolume(ohlcv) {
         spike: rel > 2.0,
         confirmed: (priceCh > 0 && rel > 1.2) || (priceCh < 0 && rel > 1.2),
         divergence: priceCh > 0 && rel < 0.7,
+        isPriceUp: priceCh > 0, // direction flag — computeScore ko closes array pass karne ki zaroorat nahi
     };
 }
 
@@ -279,6 +280,7 @@ function computeMarketStructure(ohlcv) {
 // SCORING ENGINE — weighted, deterministic, bounded 0-100
 // ─────────────────────────────────────────────────────────────────────────────
 
+// closes parameter removed — volume object mein isPriceUp flag already calculated hai
 function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
     let longPoints = 0;
     let shortPoints = 0;
@@ -304,27 +306,28 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
     }
 
     // ── MACD (weight 20) ───────────────────────────────────────────────────
-    // CRITICAL FIX: multiplier 800 → 3000 — normalizedHistogram typically 0.001-0.005
-    // At 800: 0.003 * 800 = 2.4 out of 20 — barely registers!
-    // At 3000: 0.003 * 3000 = 9 out of 20 — meaningful contribution
+    // Audit Fix #1: Histogram-only scoring mein "infinite points trap" tha
+    // Bina crossover ke bhi pure 20pts mil jaate the — risky
+    // Ab: crossover = full weight, histogram expand = capped at 60% of weight
     if (macd) {
         const rawStrength = Math.abs(macd.normalizedHistogram) * 3000;
-        const histStrength = Math.min(W.MACD, rawStrength);
+        // Crossover nahi hua to max 60% weight — momentum confirm karta hai, lead nahi karta
+        const histStrength = Math.min(W.MACD * 0.6, rawStrength);
 
         if (macd.crossover) {
-            longPoints += W.MACD; // crossover = max points
+            longPoints += W.MACD; // crossover = confirmed momentum = full points
             reasons.push('MACD bullish crossover — strong momentum signal');
         } else if (macd.crossunder) {
             shortPoints += W.MACD;
             reasons.push('MACD bearish crossunder — strong momentum signal');
         } else if (macd.bullish) {
-            longPoints += histStrength;
-            if (histStrength > W.MACD * 0.4) reasons.push('MACD histogram expanding bullish');
+            longPoints += histStrength; // capped at 12/20
+            if (histStrength > W.MACD * 0.3) reasons.push('MACD histogram expanding bullish');
         } else if (macd.bearish) {
-            shortPoints += histStrength;
-            if (histStrength > W.MACD * 0.4) reasons.push('MACD histogram expanding bearish');
+            shortPoints += histStrength; // capped at 12/20
+            if (histStrength > W.MACD * 0.3) reasons.push('MACD histogram expanding bearish');
         }
-        // MACD neutral (histogram shrinking) = no points — correct behaviour
+        // Neutral (shrinking histogram) = no points — correct behaviour
     }
 
     // ── RSI (weight 15) ────────────────────────────────────────────────────
@@ -349,47 +352,24 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
     }
 
     // ── Volume (weight 15) ─────────────────────────────────────────────────
-    // FIX: Volume should DIRECTIONALLY confirm — not just boost whichever side is winning
+    // isPriceUp flag computeVolume mein pehle se calculate ho chuka hai
+    // closes array ka yahan koi dependency nahi — clean aur thread-safe
     if (volume) {
-        if (volume.spike) {
-            // High volume: determine direction from price change
-            // Then boost that direction's score — volume confirms momentum
-            if (volume.confirmed) {
-                // Price up + high volume = bullish confirmation
-                // Price down + high volume = bearish confirmation
-                // We need price direction to know which side to boost
-                // Use EMA score as direction proxy if available
-                if (ema && ema.score > 3) {
-                    longPoints  += W.VOLUME * 0.9;
-                    reasons.push(`Volume spike ${volume.relativeVolume}× confirming bullish move`);
-                } else if (ema && ema.score < 3) {
-                    shortPoints += W.VOLUME * 0.9;
-                    reasons.push(`Volume spike ${volume.relativeVolume}× confirming bearish move`);
-                } else {
-                    // Direction unclear — small boost to leading side
-                    const bonus = W.VOLUME * 0.4;
-                    if (longPoints >= shortPoints) longPoints += bonus;
-                    else shortPoints += bonus;
-                    reasons.push(`Volume spike ${volume.relativeVolume}× — direction ambiguous`);
-                }
+        if (volume.spike || (volume.confirmed && volume.relativeVolume > 1.2)) {
+            const allocatedPoints = volume.spike ? W.VOLUME * 0.9 : W.VOLUME * 0.5;
+
+            if (volume.isPriceUp) {
+                longPoints  += allocatedPoints;
+                reasons.push(`Volume expansion (${volume.relativeVolume}×) confirming bullish price action`);
             } else {
-                // Volume spike but no clear price confirmation — small neutral boost
-                const bonus = W.VOLUME * 0.3;
-                if (longPoints >= shortPoints) longPoints += bonus;
-                else shortPoints += bonus;
-                reasons.push(`Volume spike ${volume.relativeVolume}× average — momentum present`);
+                shortPoints += allocatedPoints;
+                reasons.push(`Volume expansion (${volume.relativeVolume}×) confirming bearish price action`);
             }
-        } else if (volume.confirmed && volume.relativeVolume > 1.2) {
-            // Normal above-avg volume confirming a move
-            const bonus = W.VOLUME * 0.5;
-            if (ema && ema.score > 3) longPoints  += bonus;
-            else if (ema && ema.score < 3) shortPoints += bonus;
         }
 
         if (volume.divergence) {
-            // Price rising but volume falling = weak move, reduce bull points
             longPoints = Math.max(0, longPoints - W.VOLUME * 0.4);
-            reasons.push('Volume divergence — price rising but volume weak, caution advised');
+            reasons.push('Volume divergence detected — upward move losing momentum');
         }
     }
 
@@ -505,18 +485,23 @@ async function processAssetIntelligence(symbol) {
     const T = CONFIG.THRESHOLDS;
     let action, confidence;
 
-    // longScore aur shortScore dono independent 0-100 scale par hain
-    // Jis side ka score higher aur threshold cross kare, woh action milega
-    if (longScore >= T.STRONG_BUY && longScore > shortScore) {
+    // Audit Fix #3: Sideways trap — sirf spread check nahi tha
+    // longScore=52, shortScore=49 par bhi BUY flash hota tha (3pts farq par!)
+    // Ab minimum spread (separation) enforce kiya — false signals se bachao
+    const scoreSpread = Math.abs(longScore - shortScore);
+    const STRONG_SPREAD = 12; // Strong signal ke liye minimum 12pts gap
+    const NORMAL_SPREAD = 6;  // Normal signal ke liye minimum 6pts gap
+
+    if (longScore >= T.STRONG_BUY && longScore > shortScore && scoreSpread >= STRONG_SPREAD) {
         action = 'BUY'; confidence = longScore;
-    } else if (shortScore >= T.STRONG_SELL && shortScore > longScore) {
+    } else if (shortScore >= T.STRONG_SELL && shortScore > longScore && scoreSpread >= STRONG_SPREAD) {
         action = 'SELL'; confidence = shortScore;
-    } else if (longScore >= T.BUY && longScore > shortScore) {
+    } else if (longScore >= T.BUY && longScore > shortScore && scoreSpread >= NORMAL_SPREAD) {
         action = 'BUY'; confidence = longScore;
-    } else if (shortScore >= T.SELL && shortScore > longScore) {
+    } else if (shortScore >= T.SELL && shortScore > longScore && scoreSpread >= NORMAL_SPREAD) {
         action = 'SELL'; confidence = shortScore;
     } else {
-        // Neutral zone — check for conditions to avoid
+        // Neutral / sideways — check for specific avoidance conditions
         const shouldAvoid = (rsi?.oversold && !macd?.bullish) || (rsi?.overbought && !macd?.bearish) || volume?.divergence;
         action = shouldAvoid ? 'AVOID' : 'HOLD';
         confidence = Math.max(longScore, shortScore);
