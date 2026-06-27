@@ -294,7 +294,7 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
         const emaBullPct = ema.score / 6;        // 0.0 to 1.0
         const emaBearPct = (6 - ema.score) / 6;  // 1.0 to 0.0
 
-        longPoints  += emaBullPct * W.EMA_TREND;
+        longPoints += emaBullPct * W.EMA_TREND;
         shortPoints += emaBearPct * W.EMA_TREND;
 
         if (ema.fullyAlignedBull) reasons.push('Full bullish EMA alignment (price > EMA20 > EMA50 > EMA200)');
@@ -344,7 +344,7 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
             // RSI 65 → bullish partial: (65-50)/20 * 15 = 11.25
             const rsiDelta = rsi.value - 50; // positive = bullish, negative = bearish
             if (rsiDelta > 0) {
-                longPoints  += Math.min(W.RSI * 0.8, (rsiDelta / 20) * W.RSI);
+                longPoints += Math.min(W.RSI * 0.8, (rsiDelta / 20) * W.RSI);
             } else {
                 shortPoints += Math.min(W.RSI * 0.8, (Math.abs(rsiDelta) / 20) * W.RSI);
             }
@@ -359,7 +359,7 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
             const allocatedPoints = volume.spike ? W.VOLUME * 0.9 : W.VOLUME * 0.5;
 
             if (volume.isPriceUp) {
-                longPoints  += allocatedPoints;
+                longPoints += allocatedPoints;
                 reasons.push(`Volume expansion (${volume.relativeVolume}×) confirming bullish price action`);
             } else {
                 shortPoints += allocatedPoints;
@@ -376,7 +376,7 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
     // ── Market Structure (weight 12) ───────────────────────────────────────
     if (structure) {
         if (structure.breakout) {
-            longPoints  += W.STRUCTURE;
+            longPoints += W.STRUCTURE;
             reasons.push('Breakout above recent resistance zone');
         }
         if (structure.breakdown) {
@@ -388,13 +388,13 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
     // ── StochRSI (weight 8) ────────────────────────────────────────────────
     if (stoch) {
         if (stoch.oversold && stoch.kAboveD) {
-            longPoints  += W.STOCH_RSI;
+            longPoints += W.STOCH_RSI;
             reasons.push('StochRSI oversold with K > D — bullish momentum building');
         } else if (stoch.overbought && !stoch.kAboveD) {
             shortPoints += W.STOCH_RSI;
             reasons.push('StochRSI overbought with K < D — bearish momentum building');
         } else if (stoch.kAboveD && !stoch.overbought) {
-            longPoints  += W.STOCH_RSI * 0.4; // mild bullish bias
+            longPoints += W.STOCH_RSI * 0.4; // mild bullish bias
         } else if (!stoch.kAboveD && !stoch.oversold) {
             shortPoints += W.STOCH_RSI * 0.4; // mild bearish bias
         }
@@ -403,7 +403,7 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
     // ── Normalize to 0-100 ─────────────────────────────────────────────────
     // maxPossible = sum of all weights = 100
     const maxPossible = Object.values(W).reduce((a, b) => a + b, 0);
-    const longScore  = Math.max(0, Math.min(100, Math.round((longPoints  / maxPossible) * 100)));
+    const longScore = Math.max(0, Math.min(100, Math.round((longPoints / maxPossible) * 100)));
     const shortScore = Math.max(0, Math.min(100, Math.round((shortPoints / maxPossible) * 100)));
 
     // Fallback reason if nothing triggered
@@ -456,7 +456,7 @@ async function processAssetIntelligence(symbol) {
 
     // Fetch ticker + 1H candles in parallel (5m and 1d removed — not used in scoring)
     const [ohlcv1h, ticker] = await Promise.all([
-        withRetry(() => exchange.fetchOHLCV(symbol, '1h', undefined, CONFIG.CANDLE_LIMIT)),
+        withRetry(() => exchange.fetchOHLCV(symbol, '15m', undefined, CONFIG.CANDLE_LIMIT)),
         withRetry(() => exchange.fetchTicker(symbol)),
     ]);
 
