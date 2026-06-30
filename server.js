@@ -15,14 +15,15 @@ const CONFIG = {
     REFRESH_INTERVAL_MS: 30000, // 30s — respectful of rate limits
     PORT: 5000,
 
-    // Scoring weights — must reflect indicator reliability
+    // Scoring weights — total = 100
     WEIGHTS: {
-        EMA_TREND: 30,   // strongest: multi-period alignment is robust
-        MACD: 20,   // reliable momentum indicator
-        RSI: 15,   // oscillator — confirms, doesn't lead
-        VOLUME: 15,   // confirms price moves
-        STRUCTURE: 12,   // support/resistance
-        STOCH_RSI: 8,   // fine-tuning oscillator
+        EMA_TREND:  30,  // strongest: multi-period alignment is robust
+        MACD:       20,  // reliable momentum indicator
+        RSI:        15,  // oscillator — confirms, doesn't lead
+        VOLUME:     15,  // confirms price moves
+        STRUCTURE:   8,  // support/resistance (reduced to make room for BB)
+        STOCH_RSI:   7,  // fine-tuning oscillator (reduced to make room for BB)
+        BB:          5,  // Bollinger Bands — squeeze + pctB position
     },
 
     // Action thresholds — symmetric scoring ke liye
@@ -259,20 +260,44 @@ function computeVolume(ohlcv) {
 
 function computeMarketStructure(ohlcv) {
     const highs = ohlcv.map(c => c[2]);
-    const lows = ohlcv.map(c => c[3]);
+    const lows  = ohlcv.map(c => c[3]);
     const price = ohlcv[ohlcv.length - 1][4];
 
-    // Recent 10-candle high/low for support & resistance
-    const recentHighs = highs.slice(-10);
-    const recentLows = lows.slice(-10);
-    const resistance = Math.max(...recentHighs);
-    const support = Math.min(...recentLows);
+    // Fix: 10 candles → 30 candles — zyada meaningful S/R levels, kam noise
+    // Fix: breakout threshold 0.2% → 0.8% — wick-level false breakouts filter ho jayenge
+    const recentHighs = highs.slice(-30);
+    const recentLows  = lows.slice(-30);
+    const resistance  = Math.max(...recentHighs);
+    const support     = Math.min(...recentLows);
+
+    // Swing High/Low structure — HH/HL (uptrend) vs LH/LL (downtrend)
+    // Last 3 pivot highs aur lows compare karo
+    const pivotLen = 5; // har pivot ke liye 5-candle window
+    const pivotHighs = [];
+    const pivotLows  = [];
+    for (let i = pivotLen; i < ohlcv.length - pivotLen; i++) {
+        const localHighs = highs.slice(i - pivotLen, i + pivotLen + 1);
+        const localLows  = lows.slice(i  - pivotLen, i + pivotLen + 1);
+        if (highs[i] === Math.max(...localHighs)) pivotHighs.push(highs[i]);
+        if (lows[i]  === Math.min(...localLows))  pivotLows.push(lows[i]);
+    }
+
+    // Last 2 pivot highs aur lows se trend structure determine karo
+    const ph = pivotHighs.slice(-2);
+    const pl = pivotLows.slice(-2);
+    const higherHighs = ph.length >= 2 && ph[1] > ph[0];
+    const higherLows  = pl.length >= 2 && pl[1] > pl[0];
+    const lowerHighs  = ph.length >= 2 && ph[1] < ph[0];
+    const lowerLows   = pl.length >= 2 && pl[1] < pl[0];
 
     return {
-        support: +support.toFixed(8),
-        resistance: +resistance.toFixed(8),
-        breakout: price > resistance * 0.998,
-        breakdown: price < support * 1.002,
+        support:     +support.toFixed(8),
+        resistance:  +resistance.toFixed(8),
+        breakout:    price > resistance * 1.008,  // 0.8% above resistance — confirmed break
+        breakdown:   price < support  * 0.992,    // 0.8% below support — confirmed break
+        // Swing structure
+        uptrendStructure:   higherHighs && higherLows,   // HH + HL = uptrend
+        downtrendStructure: lowerHighs  && lowerLows,    // LH + LL = downtrend
     };
 }
 
@@ -331,22 +356,36 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
     }
 
     // ── RSI (weight 15) ────────────────────────────────────────────────────
-    // Oversold/overbought: full weight. Neutral: proportional partial score
     if (rsi) {
         if (rsi.oversold) {
             longPoints += W.RSI;
-            reasons.push(`RSI oversold at ${rsi.value} — potential reversal zone`);
+            // rsi.rising = oversold se wapas upar aa raha hai — stronger signal
+            if (rsi.rising) {
+                longPoints += W.RSI * 0.3; // momentum bonus — reversal confirm ho raha hai
+                reasons.push(`RSI oversold at ${rsi.value} and rising — bullish reversal confirming`);
+            } else {
+                reasons.push(`RSI oversold at ${rsi.value} — potential reversal zone`);
+            }
         } else if (rsi.overbought) {
             shortPoints += W.RSI;
-            reasons.push(`RSI overbought at ${rsi.value} — potential reversal zone`);
+            if (!rsi.rising) {
+                // Overbought aur ab girne laga — peak confirm
+                shortPoints += W.RSI * 0.3;
+                reasons.push(`RSI overbought at ${rsi.value} and falling — bearish reversal confirming`);
+            } else {
+                reasons.push(`RSI overbought at ${rsi.value} — potential reversal zone`);
+            }
         } else {
-            // Neutral zone: linear scaling from 0 at RSI=50 to W.RSI at RSI=70/30
-            // RSI 65 → bullish partial: (65-50)/20 * 15 = 11.25
-            const rsiDelta = rsi.value - 50; // positive = bullish, negative = bearish
+            // Neutral zone: linear scaling 0 at RSI=50 to W.RSI at RSI=70/30
+            const rsiDelta = rsi.value - 50;
             if (rsiDelta > 0) {
                 longPoints  += Math.min(W.RSI * 0.8, (rsiDelta / 20) * W.RSI);
+                // Rising RSI in bullish zone = additional momentum confirmation
+                if (rsi.rising) longPoints += W.RSI * 0.1;
             } else {
                 shortPoints += Math.min(W.RSI * 0.8, (Math.abs(rsiDelta) / 20) * W.RSI);
+                // Falling RSI in bearish zone = additional momentum confirmation
+                if (!rsi.rising) shortPoints += W.RSI * 0.1;
             }
         }
     }
@@ -373,19 +412,29 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
         }
     }
 
-    // ── Market Structure (weight 12) ───────────────────────────────────────
+    // ── Market Structure (weight 8) ────────────────────────────────────────
     if (structure) {
+        // Confirmed breakout/breakdown (0.8% threshold — wick-level noise filtered)
         if (structure.breakout) {
             longPoints  += W.STRUCTURE;
-            reasons.push('Breakout above recent resistance zone');
+            reasons.push('Confirmed breakout above 30-candle resistance');
         }
         if (structure.breakdown) {
             shortPoints += W.STRUCTURE;
-            reasons.push('Breakdown below recent support zone');
+            reasons.push('Confirmed breakdown below 30-candle support');
+        }
+        // Swing structure bonus — HH+HL = uptrend, LH+LL = downtrend
+        if (structure.uptrendStructure && !structure.breakout) {
+            longPoints  += W.STRUCTURE * 0.5;
+            reasons.push('Higher Highs + Higher Lows — uptrend structure intact');
+        }
+        if (structure.downtrendStructure && !structure.breakdown) {
+            shortPoints += W.STRUCTURE * 0.5;
+            reasons.push('Lower Highs + Lower Lows — downtrend structure intact');
         }
     }
 
-    // ── StochRSI (weight 8) ────────────────────────────────────────────────
+    // ── StochRSI (weight 7) ────────────────────────────────────────────────
     if (stoch) {
         if (stoch.oversold && stoch.kAboveD) {
             longPoints  += W.STOCH_RSI;
@@ -400,7 +449,36 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
         }
     }
 
-    // ── Normalize to 0-100 ─────────────────────────────────────────────────
+    // ── Bollinger Bands (weight 5) ─────────────────────────────────────────
+    // BB compute hoti thi lekin score mein contribute nahi karti thi — ab fix
+    if (bb) {
+        if (bb.squeeze) {
+            // BB squeeze = low volatility coiling — breakout imminient
+            // Direction pata nahi squeeze mein, so whichever side is currently leading gets mild boost
+            const squeezBonus = W.BB * 0.4;
+            if (longPoints >= shortPoints) {
+                longPoints  += squeezBonus;
+                reasons.push('Bollinger Band squeeze — bullish breakout building');
+            } else {
+                shortPoints += squeezBonus;
+                reasons.push('Bollinger Band squeeze — bearish breakout building');
+            }
+        } else if (bb.nearUpper) {
+            // Price near upper band = overbought territory in trend
+            shortPoints += W.BB * 0.6;
+            reasons.push('Price near upper Bollinger Band — extended, potential reversal');
+        } else if (bb.nearLower) {
+            // Price near lower band = oversold territory in trend
+            longPoints  += W.BB * 0.6;
+            reasons.push('Price near lower Bollinger Band — oversold, potential bounce');
+        } else {
+            // pctB: 0 = lower band, 1 = upper band, 0.5 = midline
+            // Above midline = mild bullish, below = mild bearish
+            const bbDelta = bb.pctB - 0.5; // -0.5 to +0.5
+            if (bbDelta > 0.1) longPoints  += W.BB * (bbDelta * 2) * 0.5;
+            else if (bbDelta < -0.1) shortPoints += W.BB * (Math.abs(bbDelta) * 2) * 0.5;
+        }
+    }
     // maxPossible = sum of all weights = 100
     const maxPossible = Object.values(W).reduce((a, b) => a + b, 0);
     const longScore  = Math.max(0, Math.min(100, Math.round((longPoints  / maxPossible) * 100)));
@@ -438,11 +516,18 @@ function computeTradeParams(price, atr, isBuy, riskScore) {
             : +Math.max(0, price - riskAmount * r).toFixed(8)
     );
 
-    const primaryRR = riskAmount > 0
-        ? `1:${(riskAmount * CONFIG.RISK.TP_RATIOS[0] / riskAmount).toFixed(1)}`
+    // Fix: riskAmount / riskAmount = 1 always — isliye "1:1.5" hamesha same tha
+    // Ab actual TP distances se proper R:R calculate karo
+    const primaryRR = riskAmount > 0 && take_profit.length > 0
+        ? `1:${(Math.abs(take_profit[0] - entry) / riskAmount).toFixed(1)}`
         : 'N/A';
 
-    return { entry, stop_loss, take_profit, risk_reward: primaryRR };
+    // Suggested position size — MAX_RISK_PCT config se (frontend ke liye useful)
+    // Example: $10,000 account, 1.5% risk = $150 max loss
+    // Position size = $150 / stopDist (in $)
+    const suggestedPositionSizePct = CONFIG.RISK.MAX_RISK_PCT;
+
+    return { entry, stop_loss, take_profit, risk_reward: primaryRR, suggestedPositionSizePct };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -454,43 +539,76 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
 
     if (cb.isOpen()) throw new Error('Circuit breaker open — skipping exchange calls');
 
-    // Fetch ticker + 1H candles in parallel (5m and 1d removed — not used in scoring)
-    const [ohlcv1h, ticker] = await Promise.all([
+    // ── Multi-Timeframe fetch ─────────────────────────────────────────────
+    // Agar requested timeframe '1h' nahi hai, toh macro confirmation ke liye
+    // 1h data bhi sath fetch karo. Agar '1h' hai, macro = primary (no extra call).
+    const macroTimeframe = '1h';
+    const needsMacro = timeframe !== macroTimeframe;
+
+    const fetchPromises = [
         withRetry(() => exchange.fetchOHLCV(symbol, timeframe, undefined, CONFIG.CANDLE_LIMIT)),
         withRetry(() => exchange.fetchTicker(symbol)),
-    ]);
+    ];
+    if (needsMacro) {
+        fetchPromises.push(withRetry(() => exchange.fetchOHLCV(symbol, macroTimeframe, undefined, CONFIG.CANDLE_LIMIT)));
+    }
+
+    const [ohlcvPrimary, ticker, ohlcvMacro] = await Promise.all(fetchPromises);
 
     const currentPrice = ticker.last;
     if (!currentPrice || !Number.isFinite(currentPrice)) throw new Error(`Invalid price for ${symbol}`);
-    if (ohlcv1h.length < 210) throw new Error(`Only ${ohlcv1h.length} candles for ${symbol} — need 210+`);
+    if (ohlcvPrimary.length < 210) throw new Error(`Only ${ohlcvPrimary.length} candles for ${symbol} — need 210+`);
+    if (needsMacro && ohlcvMacro.length < 210) throw new Error(`Macro (1h) only ${ohlcvMacro.length} candles — need 210+`);
 
-    const closes = ohlcv1h.map(c => c[4]);
+    const closes = ohlcvPrimary.map(c => c[4]);
 
-    // ── Run all indicators ────────────────────────────────────────────────
-    const rsi = computeRSI(closes);
-    const macd = computeMACD(closes);
-    const ema = computeEMAStack(closes);
-    const bb = computeBB(closes);
-    const atr = computeATR(ohlcv1h);
-    const stoch = computeStochRSI(closes);
-    const volume = computeVolume(ohlcv1h);
-    const structure = computeMarketStructure(ohlcv1h);
+    // ── 200 EMA Macro Guard ───────────────────────────────────────────────
+    // Sirf short timeframes par — 1h par yeh guard off rahega (redundant hoga)
+    let isMacroBullish = null; // null = guard inactive (1h mode)
+    if (needsMacro) {
+        const closesMacro = ohlcvMacro.map(c => c[4]);
+        const ema200macro  = EMA.calculate({ values: closesMacro, period: 200 });
+        const currentEMA200 = ema200macro[ema200macro.length - 1];
+        isMacroBullish = currentPrice > currentEMA200;
+    }
+
+    // ── Run all indicators on primary (requested) timeframe ───────────────
+    const rsi       = computeRSI(closes);
+    const macd      = computeMACD(closes);
+    const ema       = computeEMAStack(closes);
+    const bb        = computeBB(closes);
+    const atr       = computeATR(ohlcvPrimary);
+    const stoch     = computeStochRSI(closes);
+    const volume    = computeVolume(ohlcvPrimary);
+    const structure = computeMarketStructure(ohlcvPrimary);
 
     // ── Compute directional score ─────────────────────────────────────────
-    const { longScore, shortScore, reasons } = computeScore(
+    let { longScore, shortScore, reasons } = computeScore(
         currentPrice, rsi, macd, ema, bb, stoch, volume, structure
     );
+
+    // ── MTF Boost & Suppression (sirf non-1h timeframes par active) ───────
+    // Logic: agar macro trend aur short timeframe score align hon to +15 boost
+    //        agar counter-trend signal ho to -30 suppress (false signal filter)
+    if (isMacroBullish !== null) {
+        if (isMacroBullish) {
+            longScore  = Math.min(100, longScore  + 15); // trend alignment premium
+            shortScore = Math.max(0,   shortScore - 30); // counter-trend suppression
+            reasons.unshift('Macro 1H above EMA200 — institutional bullish guard active');
+        } else {
+            shortScore = Math.min(100, shortScore + 15); // trend alignment premium
+            longScore  = Math.max(0,   longScore  - 30); // counter-trend suppression
+            reasons.unshift('Macro 1H below EMA200 — institutional bearish guard active');
+        }
+    }
 
     // ── Determine action ──────────────────────────────────────────────────
     const T = CONFIG.THRESHOLDS;
     let action, confidence;
 
-    // Audit Fix #3: Sideways trap — sirf spread check nahi tha
-    // longScore=52, shortScore=49 par bhi BUY flash hota tha (3pts farq par!)
-    // Ab minimum spread (separation) enforce kiya — false signals se bachao
-    const scoreSpread = Math.abs(longScore - shortScore);
-    const STRONG_SPREAD = 12; // Strong signal ke liye minimum 12pts gap
-    const NORMAL_SPREAD = 6;  // Normal signal ke liye minimum 6pts gap
+    const scoreSpread  = Math.abs(longScore - shortScore);
+    const STRONG_SPREAD = 12;
+    const NORMAL_SPREAD = 6;
 
     if (longScore >= T.STRONG_BUY && longScore > shortScore && scoreSpread >= STRONG_SPREAD) {
         action = 'BUY'; confidence = longScore;
@@ -501,7 +619,6 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
     } else if (shortScore >= T.SELL && shortScore > longScore && scoreSpread >= NORMAL_SPREAD) {
         action = 'SELL'; confidence = shortScore;
     } else {
-        // Neutral / sideways — check for specific avoidance conditions
         const shouldAvoid = (rsi?.oversold && !macd?.bullish) || (rsi?.overbought && !macd?.bearish) || volume?.divergence;
         action = shouldAvoid ? 'AVOID' : 'HOLD';
         confidence = Math.max(longScore, shortScore);
@@ -514,12 +631,16 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
 
     // ── Trade parameters ──────────────────────────────────────────────────
     const isBuy = action === 'BUY';
-    const { entry, stop_loss, take_profit, risk_reward } = computeTradeParams(
+    const { entry, stop_loss, take_profit, risk_reward, suggestedPositionSizePct } = computeTradeParams(
         currentPrice, atr, isBuy, riskScore
     );
 
     // ── Trend label ───────────────────────────────────────────────────────
-    const trend = ema ? ema.trend : (currentPrice > closes[0] ? 'Bullish' : 'Bearish');
+    // Short timeframes: macro context bhi trend label mein show karo
+    const baseTrend = ema ? ema.trend : (currentPrice > closes[0] ? 'Bullish' : 'Bearish');
+    const trend = isMacroBullish !== null
+        ? `${baseTrend} (Macro: ${isMacroBullish ? 'Bullish' : 'Bearish'})`
+        : baseTrend;
 
     return {
         coin: coinName,
@@ -531,15 +652,17 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
         take_profit,
         risk_reward,
         risk_score: riskScore,
+        suggestedPositionSizePct,  // frontend ke liye: % of portfolio to risk
         reasons: reasons.length > 0 ? reasons : ['Market in equilibrium — no strong directional signal'],
-
-        // Extra data for advanced frontends (won't break existing structure)
         indicators: {
-            rsi: rsi ? { value: rsi.value, zone: rsi.oversold ? 'oversold' : rsi.overbought ? 'overbought' : 'neutral' } : null,
-            macd: macd ? { bullish: macd.bullish, crossover: macd.crossover } : null,
-            ema: ema ? { score: ema.score, trend: ema.trend } : null,
-            atr: atr ? { pct: atr.pct, volatility: atr.volatility } : null,
+            rsi:    rsi    ? { value: rsi.value, zone: rsi.oversold ? 'oversold' : rsi.overbought ? 'overbought' : 'neutral', rising: rsi.rising } : null,
+            macd:   macd   ? { bullish: macd.bullish, crossover: macd.crossover } : null,
+            ema:    ema    ? { score: ema.score, trend: ema.trend } : null,
+            bb:     bb     ? { pctB: bb.pctB, squeeze: bb.squeeze, nearUpper: bb.nearUpper, nearLower: bb.nearLower } : null,
+            atr:    atr    ? { pct: atr.pct, volatility: atr.volatility } : null,
             volume: volume ? { relativeVolume: volume.relativeVolume, spike: volume.spike } : null,
+            structure: structure ? { uptrendStructure: structure.uptrendStructure, downtrendStructure: structure.downtrendStructure } : null,
+            mtf: isMacroBullish !== null ? { macroBullish: isMacroBullish, guardActive: true } : { guardActive: false },
         },
     };
 }
