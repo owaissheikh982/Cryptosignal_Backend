@@ -15,6 +15,13 @@ const CONFIG = {
     REFRESH_INTERVAL_MS: 30000, // 30s — respectful of rate limits
     PORT: 5000,
 
+    // ── 🔮 DYNAMIC ENGINE CONFIG MODULE ──
+    DYNAMIC: {
+        COIN_LIMIT: 6,           // Top 6 liquid coins to process on-the-fly
+        MAX_PRICE_FILTER: 1.0,   // Strict sub-$1 boundary filter
+        MIN_24H_VOLUME_USD: 5000000, // Trigger scan only on coins with > $5M volume
+    },
+
     // Scoring weights — total = 100
     WEIGHTS: {
         EMA_TREND:  30,  // strongest: multi-period alignment is robust
@@ -53,8 +60,6 @@ const CONFIG = {
 // EXCHANGE — rate limit safe, timeout set
 // ─────────────────────────────────────────────────────────────────────────────
 
-// BUG FIX #1: Variable naam "binance" misleading tha — actually KuCoin use ho raha hai
-// Rename kiya: binance → exchange (future exchange swap bhi easy hoga)
 const exchange = new ccxt.kucoin({
     enableRateLimit: true,
     timeout: 30000,
@@ -149,9 +154,6 @@ function computeMACD(closes) {
     const histogram = cur.MACD - cur.signal;
     const prevHistogram = (prev?.MACD ?? cur.MACD) - (prev?.signal ?? cur.signal);
 
-    // CRITICAL FIX: normalize histogram by price to make cross-coin comparable
-    // BTC histogram of 100 is noise; PEPE histogram of 0.000001 is huge — without
-    // normalization, large-cap coins always dominate the score unfairly.
     const price = closes[closes.length - 1];
     const normalizedHistogram = price > 0 ? (histogram / price) * 100 : 0;
 
@@ -176,7 +178,6 @@ function computeEMAStack(closes) {
     const e200 = ema200[ema200.length - 1];
     const p = closes[closes.length - 1];
 
-    // Score 0-6: each true condition adds 1
     const score =
         (p > e20 ? 1 : 0) +
         (p > e50 ? 1 : 0) +
@@ -254,7 +255,7 @@ function computeVolume(ohlcv) {
         spike: rel > 2.0,
         confirmed: (priceCh > 0 && rel > 1.2) || (priceCh < 0 && rel > 1.2),
         divergence: priceCh > 0 && rel < 0.7,
-        isPriceUp: priceCh > 0, // direction flag — computeScore ko closes array pass karne ki zaroorat nahi
+        isPriceUp: priceCh > 0,
     };
 }
 
@@ -263,16 +264,12 @@ function computeMarketStructure(ohlcv) {
     const lows  = ohlcv.map(c => c[3]);
     const price = ohlcv[ohlcv.length - 1][4];
 
-    // Fix: 10 candles → 30 candles — zyada meaningful S/R levels, kam noise
-    // Fix: breakout threshold 0.2% → 0.8% — wick-level false breakouts filter ho jayenge
     const recentHighs = highs.slice(-30);
     const recentLows  = lows.slice(-30);
     const resistance  = Math.max(...recentHighs);
     const support     = Math.min(...recentLows);
 
-    // Swing High/Low structure — HH/HL (uptrend) vs LH/LL (downtrend)
-    // Last 3 pivot highs aur lows compare karo
-    const pivotLen = 5; // har pivot ke liye 5-candle window
+    const pivotLen = 5;
     const pivotHighs = [];
     const pivotLows  = [];
     for (let i = pivotLen; i < ohlcv.length - pivotLen; i++) {
@@ -282,7 +279,6 @@ function computeMarketStructure(ohlcv) {
         if (lows[i]  === Math.min(...localLows))  pivotLows.push(lows[i]);
     }
 
-    // Last 2 pivot highs aur lows se trend structure determine karo
     const ph = pivotHighs.slice(-2);
     const pl = pivotLows.slice(-2);
     const higherHighs = ph.length >= 2 && ph[1] > ph[0];
@@ -293,11 +289,10 @@ function computeMarketStructure(ohlcv) {
     return {
         support:     +support.toFixed(8),
         resistance:  +resistance.toFixed(8),
-        breakout:    price > resistance * 1.008,  // 0.8% above resistance — confirmed break
-        breakdown:   price < support  * 0.992,    // 0.8% below support — confirmed break
-        // Swing structure
-        uptrendStructure:   higherHighs && higherLows,   // HH + HL = uptrend
-        downtrendStructure: lowerHighs  && lowerLows,    // LH + LL = downtrend
+        breakout:    price > resistance * 1.008,
+        breakdown:   price < support  * 0.992,
+        uptrendStructure:   higherHighs && higherLows,
+        downtrendStructure: lowerHighs  && lowerLows,
     };
 }
 
@@ -305,20 +300,15 @@ function computeMarketStructure(ohlcv) {
 // SCORING ENGINE — weighted, deterministic, bounded 0-100
 // ─────────────────────────────────────────────────────────────────────────────
 
-// closes parameter removed — volume object mein isPriceUp flag already calculated hai
 function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
     let longPoints = 0;
     let shortPoints = 0;
     const reasons = [];
     const W = CONFIG.WEIGHTS;
 
-    // ── EMA Trend (weight 30) ──────────────────────────────────────────────
-    // Score 0-6: EMA alignment — direct bullish/bearish signal
     if (ema) {
-        // Bullish points: score/6 fraction of full weight
-        const emaBullPct = ema.score / 6;        // 0.0 to 1.0
-        const emaBearPct = (6 - ema.score) / 6;  // 1.0 to 0.0
-
+        const emaBullPct = ema.score / 6;
+        const emaBearPct = (6 - ema.score) / 6;
         longPoints  += emaBullPct * W.EMA_TREND;
         shortPoints += emaBearPct * W.EMA_TREND;
 
@@ -330,38 +320,30 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
         else if (ema.score <= 2) reasons.push(`EMA stack bearish (only ${ema.score}/6 aligned)`);
     }
 
-    // ── MACD (weight 20) ───────────────────────────────────────────────────
-    // Audit Fix #1: Histogram-only scoring mein "infinite points trap" tha
-    // Bina crossover ke bhi pure 20pts mil jaate the — risky
-    // Ab: crossover = full weight, histogram expand = capped at 60% of weight
     if (macd) {
         const rawStrength = Math.abs(macd.normalizedHistogram) * 3000;
-        // Crossover nahi hua to max 60% weight — momentum confirm karta hai, lead nahi karta
         const histStrength = Math.min(W.MACD * 0.6, rawStrength);
 
         if (macd.crossover) {
-            longPoints += W.MACD; // crossover = confirmed momentum = full points
+            longPoints += W.MACD;
             reasons.push('MACD bullish crossover — strong momentum signal');
         } else if (macd.crossunder) {
             shortPoints += W.MACD;
             reasons.push('MACD bearish crossunder — strong momentum signal');
         } else if (macd.bullish) {
-            longPoints += histStrength; // capped at 12/20
+            longPoints += histStrength;
             if (histStrength > W.MACD * 0.3) reasons.push('MACD histogram expanding bullish');
         } else if (macd.bearish) {
-            shortPoints += histStrength; // capped at 12/20
+            shortPoints += histStrength;
             if (histStrength > W.MACD * 0.3) reasons.push('MACD histogram expanding bearish');
         }
-        // Neutral (shrinking histogram) = no points — correct behaviour
     }
 
-    // ── RSI (weight 15) ────────────────────────────────────────────────────
     if (rsi) {
         if (rsi.oversold) {
             longPoints += W.RSI;
-            // rsi.rising = oversold se wapas upar aa raha hai — stronger signal
             if (rsi.rising) {
-                longPoints += W.RSI * 0.3; // momentum bonus — reversal confirm ho raha hai
+                longPoints += W.RSI * 0.3;
                 reasons.push(`RSI oversold at ${rsi.value} and rising — bullish reversal confirming`);
             } else {
                 reasons.push(`RSI oversold at ${rsi.value} — potential reversal zone`);
@@ -369,34 +351,26 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
         } else if (rsi.overbought) {
             shortPoints += W.RSI;
             if (!rsi.rising) {
-                // Overbought aur ab girne laga — peak confirm
                 shortPoints += W.RSI * 0.3;
                 reasons.push(`RSI overbought at ${rsi.value} and falling — bearish reversal confirming`);
             } else {
                 reasons.push(`RSI overbought at ${rsi.value} — potential reversal zone`);
             }
         } else {
-            // Neutral zone: linear scaling 0 at RSI=50 to W.RSI at RSI=70/30
             const rsiDelta = rsi.value - 50;
             if (rsiDelta > 0) {
                 longPoints  += Math.min(W.RSI * 0.8, (rsiDelta / 20) * W.RSI);
-                // Rising RSI in bullish zone = additional momentum confirmation
                 if (rsi.rising) longPoints += W.RSI * 0.1;
             } else {
                 shortPoints += Math.min(W.RSI * 0.8, (Math.abs(rsiDelta) / 20) * W.RSI);
-                // Falling RSI in bearish zone = additional momentum confirmation
                 if (!rsi.rising) shortPoints += W.RSI * 0.1;
             }
         }
     }
 
-    // ── Volume (weight 15) ─────────────────────────────────────────────────
-    // isPriceUp flag computeVolume mein pehle se calculate ho chuka hai
-    // closes array ka yahan koi dependency nahi — clean aur thread-safe
     if (volume) {
         if (volume.spike || (volume.confirmed && volume.relativeVolume > 1.2)) {
             const allocatedPoints = volume.spike ? W.VOLUME * 0.9 : W.VOLUME * 0.5;
-
             if (volume.isPriceUp) {
                 longPoints  += allocatedPoints;
                 reasons.push(`Volume expansion (${volume.relativeVolume}×) confirming bullish price action`);
@@ -405,16 +379,13 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
                 reasons.push(`Volume expansion (${volume.relativeVolume}×) confirming bearish price action`);
             }
         }
-
         if (volume.divergence) {
             longPoints = Math.max(0, longPoints - W.VOLUME * 0.4);
             reasons.push('Volume divergence detected — upward move losing momentum');
         }
     }
 
-    // ── Market Structure (weight 8) ────────────────────────────────────────
     if (structure) {
-        // Confirmed breakout/breakdown (0.8% threshold — wick-level noise filtered)
         if (structure.breakout) {
             longPoints  += W.STRUCTURE;
             reasons.push('Confirmed breakout above 30-candle resistance');
@@ -423,7 +394,6 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
             shortPoints += W.STRUCTURE;
             reasons.push('Confirmed breakdown below 30-candle support');
         }
-        // Swing structure bonus — HH+HL = uptrend, LH+LL = downtrend
         if (structure.uptrendStructure && !structure.breakout) {
             longPoints  += W.STRUCTURE * 0.5;
             reasons.push('Higher Highs + Higher Lows — uptrend structure intact');
@@ -434,7 +404,6 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
         }
     }
 
-    // ── StochRSI (weight 7) ────────────────────────────────────────────────
     if (stoch) {
         if (stoch.oversold && stoch.kAboveD) {
             longPoints  += W.STOCH_RSI;
@@ -443,18 +412,14 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
             shortPoints += W.STOCH_RSI;
             reasons.push('StochRSI overbought with K < D — bearish momentum building');
         } else if (stoch.kAboveD && !stoch.overbought) {
-            longPoints  += W.STOCH_RSI * 0.4; // mild bullish bias
+            longPoints  += W.STOCH_RSI * 0.4;
         } else if (!stoch.kAboveD && !stoch.oversold) {
-            shortPoints += W.STOCH_RSI * 0.4; // mild bearish bias
+            shortPoints += W.STOCH_RSI * 0.4;
         }
     }
 
-    // ── Bollinger Bands (weight 5) ─────────────────────────────────────────
-    // BB compute hoti thi lekin score mein contribute nahi karti thi — ab fix
     if (bb) {
         if (bb.squeeze) {
-            // BB squeeze = low volatility coiling — breakout imminient
-            // Direction pata nahi squeeze mein, so whichever side is currently leading gets mild boost
             const squeezBonus = W.BB * 0.4;
             if (longPoints >= shortPoints) {
                 longPoints  += squeezBonus;
@@ -464,27 +429,22 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
                 reasons.push('Bollinger Band squeeze — bearish breakout building');
             }
         } else if (bb.nearUpper) {
-            // Price near upper band = overbought territory in trend
             shortPoints += W.BB * 0.6;
             reasons.push('Price near upper Bollinger Band — extended, potential reversal');
         } else if (bb.nearLower) {
-            // Price near lower band = oversold territory in trend
             longPoints  += W.BB * 0.6;
             reasons.push('Price near lower Bollinger Band — oversold, potential bounce');
         } else {
-            // pctB: 0 = lower band, 1 = upper band, 0.5 = midline
-            // Above midline = mild bullish, below = mild bearish
-            const bbDelta = bb.pctB - 0.5; // -0.5 to +0.5
+            const bbDelta = bb.pctB - 0.5;
             if (bbDelta > 0.1) longPoints  += W.BB * (bbDelta * 2) * 0.5;
             else if (bbDelta < -0.1) shortPoints += W.BB * (Math.abs(bbDelta) * 2) * 0.5;
         }
     }
-    // maxPossible = sum of all weights = 100
+
     const maxPossible = Object.values(W).reduce((a, b) => a + b, 0);
     const longScore  = Math.max(0, Math.min(100, Math.round((longPoints  / maxPossible) * 100)));
     const shortScore = Math.max(0, Math.min(100, Math.round((shortPoints / maxPossible) * 100)));
 
-    // Fallback reason if nothing triggered
     if (reasons.length === 0) {
         if (longScore > shortScore) reasons.push('Mild bullish confluence — no strong single signal');
         else if (shortScore > longScore) reasons.push('Mild bearish confluence — no strong single signal');
@@ -501,7 +461,6 @@ function computeScore(price, rsi, macd, ema, bb, stoch, volume, structure) {
 function computeTradeParams(price, atr, isBuy, riskScore) {
     if (!price || !atr?.value) return { entry: price, stop_loss: 0, take_profit: [], risk_reward: 'N/A' };
 
-    // Widen stop slightly if volatility is high (risk-adjusted)
     const riskAdj = 1 + (riskScore / 100) * 0.4;
     const stopDist = atr.value * CONFIG.RISK.ATR_STOP_MULTIPLIER * riskAdj;
     const entry = +price.toFixed(8);
@@ -516,15 +475,10 @@ function computeTradeParams(price, atr, isBuy, riskScore) {
             : +Math.max(0, price - riskAmount * r).toFixed(8)
     );
 
-    // Fix: riskAmount / riskAmount = 1 always — isliye "1:1.5" hamesha same tha
-    // Ab actual TP distances se proper R:R calculate karo
     const primaryRR = riskAmount > 0 && take_profit.length > 0
         ? `1:${(Math.abs(take_profit[0] - entry) / riskAmount).toFixed(1)}`
         : 'N/A';
 
-    // Suggested position size — MAX_RISK_PCT config se (frontend ke liye useful)
-    // Example: $10,000 account, 1.5% risk = $150 max loss
-    // Position size = $150 / stopDist (in $)
     const suggestedPositionSizePct = CONFIG.RISK.MAX_RISK_PCT;
 
     return { entry, stop_loss, take_profit, risk_reward: primaryRR, suggestedPositionSizePct };
@@ -539,9 +493,6 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
 
     if (cb.isOpen()) throw new Error('Circuit breaker open — skipping exchange calls');
 
-    // ── Multi-Timeframe fetch ─────────────────────────────────────────────
-    // Agar requested timeframe '1h' nahi hai, toh macro confirmation ke liye
-    // 1h data bhi sath fetch karo. Agar '1h' hai, macro = primary (no extra call).
     const macroTimeframe = '1h';
     const needsMacro = timeframe !== macroTimeframe;
 
@@ -562,9 +513,7 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
 
     const closes = ohlcvPrimary.map(c => c[4]);
 
-    // ── 200 EMA Macro Guard ───────────────────────────────────────────────
-    // Sirf short timeframes par — 1h par yeh guard off rahega (redundant hoga)
-    let isMacroBullish = null; // null = guard inactive (1h mode)
+    let isMacroBullish = null;
     if (needsMacro) {
         const closesMacro = ohlcvMacro.map(c => c[4]);
         const ema200macro  = EMA.calculate({ values: closesMacro, period: 200 });
@@ -572,7 +521,6 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
         isMacroBullish = currentPrice > currentEMA200;
     }
 
-    // ── Run all indicators on primary (requested) timeframe ───────────────
     const rsi       = computeRSI(closes);
     const macd      = computeMACD(closes);
     const ema       = computeEMAStack(closes);
@@ -582,27 +530,22 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
     const volume    = computeVolume(ohlcvPrimary);
     const structure = computeMarketStructure(ohlcvPrimary);
 
-    // ── Compute directional score ─────────────────────────────────────────
     let { longScore, shortScore, reasons } = computeScore(
         currentPrice, rsi, macd, ema, bb, stoch, volume, structure
     );
 
-    // ── MTF Boost & Suppression (sirf non-1h timeframes par active) ───────
-    // Logic: agar macro trend aur short timeframe score align hon to +15 boost
-    //        agar counter-trend signal ho to -30 suppress (false signal filter)
     if (isMacroBullish !== null) {
         if (isMacroBullish) {
-            longScore  = Math.min(100, longScore  + 15); // trend alignment premium
-            shortScore = Math.max(0,   shortScore - 30); // counter-trend suppression
+            longScore  = Math.min(100, longScore  + 15);
+            shortScore = Math.max(0,   shortScore - 30);
             reasons.unshift('Macro 1H above EMA200 — institutional bullish guard active');
         } else {
-            shortScore = Math.min(100, shortScore + 15); // trend alignment premium
-            longScore  = Math.max(0,   longScore  - 30); // counter-trend suppression
+            shortScore = Math.min(100, shortScore + 15);
+            longScore  = Math.max(0,   longScore  - 30);
             reasons.unshift('Macro 1H below EMA200 — institutional bearish guard active');
         }
     }
 
-    // ── Determine action ──────────────────────────────────────────────────
     const T = CONFIG.THRESHOLDS;
     let action, confidence;
 
@@ -624,19 +567,13 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
         confidence = Math.max(longScore, shortScore);
     }
 
-    // ── Risk score (volatility-derived, bounded) ───────────────────────────
-    const riskScore = Math.max(10, Math.min(95,
-        Math.round(20 + (atr?.pct ?? 2) * 5)
-    ));
+    const riskScore = Math.max(10, Math.min(95, Math.round(20 + (atr?.pct ?? 2) * 5)));
 
-    // ── Trade parameters ──────────────────────────────────────────────────
     const isBuy = action === 'BUY';
     const { entry, stop_loss, take_profit, risk_reward, suggestedPositionSizePct } = computeTradeParams(
         currentPrice, atr, isBuy, riskScore
     );
 
-    // ── Trend label ───────────────────────────────────────────────────────
-    // Short timeframes: macro context bhi trend label mein show karo
     const baseTrend = ema ? ema.trend : (currentPrice > closes[0] ? 'Bullish' : 'Bearish');
     const trend = isMacroBullish !== null
         ? `${baseTrend} (Macro: ${isMacroBullish ? 'Bullish' : 'Bearish'})`
@@ -652,7 +589,7 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
         take_profit,
         risk_reward,
         risk_score: riskScore,
-        suggestedPositionSizePct,  // frontend ke liye: % of portfolio to risk
+        suggestedPositionSizePct,
         reasons: reasons.length > 0 ? reasons : ['Market in equilibrium — no strong directional signal'],
         indicators: {
             rsi:    rsi    ? { value: rsi.value, zone: rsi.oversold ? 'oversold' : rsi.overbought ? 'overbought' : 'neutral', rising: rsi.rising } : null,
@@ -668,10 +605,80 @@ async function processAssetIntelligence(symbol, timeframe = '1h') {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 🧠 🧠 DYNAMIC QUANT SCREENER SUB-ENGINE MODULE (NEW GENERATION)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// fetchTickers() cache — har request par 500+ pairs load karna slow aur unnecessary tha
+// 90 second TTL: same watchlist milegi jab tak market drastically shift na kare
+const screenerCache = {
+    watchlist: null,       // cached coin list
+    cachedAt:  0,          // timestamp
+    TTL_MS:    90_000,     // 90 seconds
+    isValid()  { return this.watchlist && (Date.now() - this.cachedAt) < this.TTL_MS; },
+    set(list)  { this.watchlist = list; this.cachedAt = Date.now(); },
+};
+
+async function runDynamicVolumePriceScreener() {
+    // Cache valid hai to fresh exchange call avoid karo
+    if (screenerCache.isValid()) {
+        console.log(`[DynamicScreener] Cache hit — returning cached watchlist (${screenerCache.watchlist.join(', ')})`);
+        return screenerCache.watchlist;
+    }
+
+    try {
+        await ensureMarketsLoaded();
+        console.log('[DynamicScreener] Cache miss — scanning full market tickers...');
+        
+        const tickers = await exchange.fetchTickers();
+        const qualifiedPool = [];
+
+        for (const [symbol, ticker] of Object.entries(tickers)) {
+            // Sirf spot USDT pairs — futures (:) exclude
+            if (!symbol.endsWith('/USDT') || symbol.includes(':')) continue;
+
+            const currentPrice  = ticker.last;
+            // Fix: explicit number check — undefined/null quoteVolume safely skip ho jaye
+            const quoteVolume24h = typeof ticker.quoteVolume === 'number' ? ticker.quoteVolume : 0;
+
+            if (
+                currentPrice &&
+                Number.isFinite(currentPrice) &&
+                currentPrice <= CONFIG.DYNAMIC.MAX_PRICE_FILTER &&   // sub-$1 filter (intentional — small capital trading)
+                quoteVolume24h >= CONFIG.DYNAMIC.MIN_24H_VOLUME_USD  // min $5M 24h volume — liquidity guarantee
+            ) {
+                qualifiedPool.push({ symbol, price: currentPrice, volume24h: quoteVolume24h });
+            }
+        }
+
+        // Sort by volume descending — highest liquidity first
+        qualifiedPool.sort((a, b) => b.volume24h - a.volume24h);
+
+        const targetedAssets = qualifiedPool.slice(0, CONFIG.DYNAMIC.COIN_LIMIT).map(a => a.symbol);
+        
+        if (targetedAssets.length === 0) {
+            console.warn('[DynamicScreener] No coins passed filters — check price/volume thresholds. Using fallback.');
+            throw new Error('No qualified coins found');
+        }
+
+        console.log(`[DynamicScreener] Qualified watchlist (${targetedAssets.length} coins): ${targetedAssets.join(', ')}`);
+        
+        // Cache kar lo — agle 90 seconds fresh exchange call nahi hogi
+        screenerCache.set(targetedAssets);
+        return targetedAssets;
+
+    } catch (screenerErr) {
+        console.error('[DynamicScreener] Screener failed:', screenerErr.message);
+        // Fallback — sub-$1 high-volume coins jo usually qualify karte hain
+        const fallback = ['PEPE/USDT', 'DOGE/USDT', 'SHIB/USDT', 'TRX/USDT', 'XLM/USDT', 'WIN/USDT'];
+        console.warn(`[DynamicScreener] Using fallback watchlist: ${fallback.join(', ')}`);
+        return fallback;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GLOBAL STATE — atomic, never half-written
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Preserves exact same structure your frontend expects
 let marketIntelligenceState = {
     marketTrend: 'NEUTRAL',
     recommendedStance: 'PRESERVE_CAPITAL',
@@ -681,20 +688,18 @@ let marketIntelligenceState = {
     shortSignal: null,
     allSignals: [],
     lastSyncTimestamp: null,
-    // Added fields (non-breaking additions)
     scanCount: 0,
     engineStatus: 'initializing',
     errors: {},
 };
 
-let isRunning = false; // CRITICAL: prevents overlapping scan runs
+let isRunning = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CORE PIPELINE — sequential per coin, atomic state update
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function coreMarketIntelligencePipeline() {
-    // RACE CONDITION FIX: if previous scan still running, skip this tick
     if (isRunning) {
         console.warn('[Pipeline] Still running from last cycle — skipping tick');
         scheduleNext();
@@ -711,9 +716,6 @@ async function coreMarketIntelligencePipeline() {
         const freshSignals = [];
         const freshErrors = {};
 
-        // Sequential per coin — Binance free tier can't handle 6 concurrent OHLCV fetches
-        // The original code's Promise.all for 6 × 4 timeframes = 24 concurrent requests
-        // That triggers rate-limit errors and produces corrupt data silently
         for (const symbol of CONFIG.TARGET_COINS) {
             try {
                 const signal = await processAssetIntelligence(symbol);
@@ -732,7 +734,6 @@ async function coreMarketIntelligencePipeline() {
             return;
         }
 
-        // ── Classify market trend ───────────────────────────────────────────
         const buyCandidates = freshSignals.filter(s => s.action === 'BUY');
         const sellCandidates = freshSignals.filter(s => s.action === 'SELL');
 
@@ -747,7 +748,6 @@ async function coreMarketIntelligencePipeline() {
             marketStance = 'HEDGE_EXPOSURE_EXECUTE_SHORTS';
         }
 
-        // ── Select best buy / short — must be different coins ─────────────
         const longSorted = [...freshSignals]
             .filter(s => s.action === 'BUY')
             .sort((a, b) => b.confidence - a.confidence);
@@ -759,7 +759,6 @@ async function coreMarketIntelligencePipeline() {
         let primaryBuy = longSorted[0] ?? null;
         let primaryShort = shortSorted[0] ?? null;
 
-        // Ensure different coins for buy vs short
         if (primaryBuy && primaryShort && primaryBuy.coin === primaryShort.coin) {
             const buyMargin = primaryBuy.confidence - (longSorted[1]?.confidence ?? 0);
             const shortMargin = primaryShort.confidence - (shortSorted[1]?.confidence ?? 0);
@@ -767,14 +766,12 @@ async function coreMarketIntelligencePipeline() {
             else primaryBuy = longSorted[1] ?? null;
         }
 
-        // ── ATOMIC STATE UPDATE — frontend reads consistent snapshot ───────
         marketIntelligenceState = {
             marketTrend: activeTrend,
             recommendedStance: marketStance,
             strongestSectors: buyCandidates.map(c => c.coin),
             weakestSectors: sellCandidates.map(c => c.coin),
 
-            // Frontend-compatible buySignal / shortSignal structure preserved
             buySignal: primaryBuy ? {
                 symbol: primaryBuy.coin,
                 price: primaryBuy.entry,
@@ -786,7 +783,7 @@ async function coreMarketIntelligencePipeline() {
             shortSignal: primaryShort ? {
                 symbol: primaryShort.coin,
                 price: primaryShort.entry,
-                confidence: primaryShort.confidence,  // ab directly shortScore hai (0-100)
+                confidence: primaryShort.confidence,
                 reason: primaryShort.reasons[0] ?? 'Bearish confluence detected',
                 type: 'SHORT',
             } : null,
@@ -801,8 +798,6 @@ async function coreMarketIntelligencePipeline() {
 
         const dur = Date.now() - startTime;
         console.log(`[Pipeline] Scan complete in ${dur}ms | Trend: ${activeTrend} | ${freshSignals.length}/${CONFIG.TARGET_COINS.length} coins`);
-        if (primaryBuy) console.log(`  TOP LONG:  ${primaryBuy.coin}  @ $${primaryBuy.entry} (${primaryBuy.confidence}%)`);
-        if (primaryShort) console.log(`  TOP SHORT: ${primaryShort.coin} @ $${primaryShort.entry} (${primaryShort.confidence}%)`);
 
     } catch (criticalErr) {
         console.error('[Pipeline] Critical error:', criticalErr.message);
@@ -813,16 +808,14 @@ async function coreMarketIntelligencePipeline() {
     }
 }
 
-// Recursive setTimeout — prevents drift and ensures no overlap with interval
 function scheduleNext() {
     setTimeout(coreMarketIntelligencePipeline, CONFIG.REFRESH_INTERVAL_MS);
 }
 
-// Boot immediately
 coreMarketIntelligencePipeline();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SIMPLE IN-MEMORY RATE LIMITER — no extra dependencies
+// SIMPLE IN-MEMORY RATE LIMITER
 // ─────────────────────────────────────────────────────────────────────────────
 
 const rateLimitStore = new Map();
@@ -840,7 +833,7 @@ function rateLimit(req, res, next) {
     }
     next();
 }
-// Cleanup every minute
+
 setInterval(() => {
     const now = Date.now();
     for (const [ip, rec] of rateLimitStore.entries()) {
@@ -849,7 +842,7 @@ setInterval(() => {
 }, 60000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EXPRESS APP
+// EXPRESS APP & ROUTING LAYERS
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
@@ -865,20 +858,17 @@ app.use(cors({
     methods: ['GET'],
 }));
 
-// Main endpoint — SAME URL as original, same response shape
-// Valid timeframes whitelist — galat request server crash na kare
 const VALID_TIMEFRAMES = ['5m', '15m', '30m', '1h', '4h', '1d'];
-const DEFAULT_TIMEFRAME = '1h'; // background pipeline isi par chalti hai
+const DEFAULT_TIMEFRAME = '1h';
 
+// ── ENDPOINT 1: STATIC/STANDARD WATCHLIST SIGNALS (UNTOUCHED 🟢)
 app.get('/api/signals', rateLimit, async (req, res) => {
     const timeframe = req.query.timeframe ?? DEFAULT_TIMEFRAME;
 
-    // Whitelist check
     if (!VALID_TIMEFRAMES.includes(timeframe)) {
         return res.status(400).json({ error: `Invalid timeframe. Valid options: ${VALID_TIMEFRAMES.join(', ')}` });
     }
 
-    // Default timeframe (1h) — cached background pipeline ka state return karo (instant)
     if (timeframe === DEFAULT_TIMEFRAME) {
         if (marketIntelligenceState.engineStatus === 'initializing') {
             return res.status(202).json({ message: 'Engine initializing — first scan in progress. Try again in 30s.' });
@@ -886,8 +876,6 @@ app.get('/api/signals', rateLimit, async (req, res) => {
         return res.json({ ...marketIntelligenceState, requestedTimeframe: timeframe });
     }
 
-    // Non-default timeframe — live on-demand scan karo
-    // Background pipeline disturb nahi hogi — yeh alag independent execution hai
     try {
         await ensureMarketsLoaded();
         const freshSignals = [];
@@ -897,19 +885,16 @@ app.get('/api/signals', rateLimit, async (req, res) => {
             try {
                 const signal = await processAssetIntelligence(symbol, timeframe);
                 freshSignals.push(signal);
-                console.log(`  [${timeframe}] ✓ ${signal.coin.padEnd(6)} | ${signal.action.padEnd(5)} | Conf: ${signal.confidence}%`);
             } catch (err) {
                 const coin = symbol.split('/')[0];
                 freshErrors[coin] = err.message;
-                console.error(`  [${timeframe}] ✗ ${coin}: ${err.message}`);
             }
         }
 
         if (freshSignals.length === 0) {
-            return res.status(503).json({ error: 'All coins failed to scan — check exchange connectivity', errors: freshErrors });
+            return res.status(503).json({ error: 'All coins failed to scan', errors: freshErrors });
         }
 
-        // Market trend classification — same logic as background pipeline
         const buyCandidates  = freshSignals.filter(s => s.action === 'BUY');
         const sellCandidates = freshSignals.filter(s => s.action === 'SELL');
         let activeTrend = 'SIDEWAYS';
@@ -920,13 +905,11 @@ app.get('/api/signals', rateLimit, async (req, res) => {
             activeTrend = 'BEARISH'; marketStance = 'HEDGE_EXPOSURE_EXECUTE_SHORTS';
         }
 
-        // Best buy / short selection — same logic as background pipeline
         const longSorted  = freshSignals.filter(s => s.action === 'BUY').sort((a, b) => b.confidence - a.confidence);
         const shortSorted = freshSignals.filter(s => s.action === 'SELL').sort((a, b) => b.confidence - a.confidence);
         let primaryBuy   = longSorted[0]  ?? null;
         let primaryShort = shortSorted[0] ?? null;
 
-        // Same-coin conflict resolution
         if (primaryBuy && primaryShort && primaryBuy.coin === primaryShort.coin) {
             const buyMargin   = primaryBuy.confidence   - (longSorted[1]?.confidence  ?? 0);
             const shortMargin = primaryShort.confidence - (shortSorted[1]?.confidence ?? 0);
@@ -949,12 +932,97 @@ app.get('/api/signals', rateLimit, async (req, res) => {
         });
 
     } catch (criticalErr) {
-        console.error(`[OnDemand/${timeframe}] Critical error:`, criticalErr.message);
         res.status(500).json({ error: criticalErr.message });
     }
 });
 
-// Single coin endpoint (new, non-breaking addition)
+// ── 🧠 ENDPOINT 2: AUTOMATED DYNAMIC SCREENER ROUTE (BRAND NEW ADDTION 🚀)
+app.get('/api/signals/dynamic', rateLimit, async (req, res) => {
+    const timeframe = req.query.timeframe ?? DEFAULT_TIMEFRAME;
+
+    if (!VALID_TIMEFRAMES.includes(timeframe)) {
+        return res.status(400).json({ error: `Invalid timeframe. Options: ${VALID_TIMEFRAMES.join(', ')}` });
+    }
+
+    try {
+        // Trigger screener — cache hit ya fresh scan
+        const fluidTargetWatchlist = await runDynamicVolumePriceScreener();
+        
+        const freshSignals = [];
+        const freshErrors = {};
+
+        // Sequential multi-threading protection loops over dynamic scanned coins
+        for (const symbol of fluidTargetWatchlist) {
+            try {
+                const signal = await processAssetIntelligence(symbol, timeframe);
+                freshSignals.push(signal);
+                console.log(`  [Dynamic/${timeframe}] ✓ ${signal.coin.padEnd(6)} | ${signal.action.padEnd(5)} | Vol Rank Safe`);
+            } catch (err) {
+                const coin = symbol.split('/')[0];
+                freshErrors[coin] = err.message;
+                console.error(`  [Dynamic/${timeframe}] ✗ ${coin}: ${err.message}`);
+            }
+        }
+
+        if (freshSignals.length === 0) {
+            return res.status(503).json({ error: 'All dynamic filtered assets failed to process calculations', errors: freshErrors });
+        }
+
+        // Structural classifications matching the primary engine logic templates
+        const buyCandidates = freshSignals.filter(s => s.action === 'BUY');
+        const sellCandidates = freshSignals.filter(s => s.action === 'SELL');
+        
+        let activeTrend = 'SIDEWAYS';
+        let marketStance = 'PRESERVE_CAPITAL';
+        
+        if (buyCandidates.length >= 2 && buyCandidates.length > sellCandidates.length) {
+            activeTrend = 'BULLISH'; marketStance = 'AGGRESSIVE_ACCUMULATION_ON_SUPPORT';
+        } else if (sellCandidates.length >= 2 && sellCandidates.length > buyCandidates.length) {
+            activeTrend = 'BEARISH'; marketStance = 'HEDGE_EXPOSURE_EXECUTE_SHORTS';
+        }
+
+        const longSorted = freshSignals.filter(s => s.action === 'BUY').sort((a, b) => b.confidence - a.confidence);
+        const shortSorted = freshSignals.filter(s => s.action === 'SELL').sort((a, b) => b.confidence - a.confidence);
+        let primaryBuy = longSorted[0] ?? null;
+        let primaryShort = shortSorted[0] ?? null;
+
+        if (primaryBuy && primaryShort && primaryBuy.coin === primaryShort.coin) {
+            const buyMargin = primaryBuy.confidence - (longSorted[1]?.confidence ?? 0);
+            const shortMargin = primaryShort.confidence - (shortSorted[1]?.confidence ?? 0);
+            if (buyMargin >= shortMargin) primaryShort = shortSorted[1] ?? null;
+            else primaryBuy = longSorted[1] ?? null;
+        }
+
+        // Return pristine layout structures matching your core UI state expectation maps
+        return res.json({
+            requestedTimeframe: timeframe,
+            marketTrend: activeTrend,
+            recommendedStance: marketStance,
+            strongestSectors: buyCandidates.map(c => c.coin),
+            weakestSectors: sellCandidates.map(c => c.coin),
+            buySignal: primaryBuy ? { symbol: primaryBuy.coin, price: primaryBuy.entry, confidence: primaryBuy.confidence, reason: primaryBuy.reasons[0] ?? 'Dynamic trend velocity buy', type: 'LONG' } : null,
+            shortSignal: primaryShort ? { symbol: primaryShort.coin, price: primaryShort.entry, confidence: primaryShort.confidence, reason: primaryShort.reasons[0] ?? 'Dynamic velocity break short', type: 'SHORT' } : null,
+            allSignals: freshSignals,
+            lastSyncTimestamp: new Date().toISOString(),
+            engineStatus: Object.keys(freshErrors).length > 0 ? 'degraded' : 'ok',
+            errors: freshErrors,
+            // Dynamic screener meta — frontend visibility
+            screenerMeta: {
+                scannedCoins:    fluidTargetWatchlist,             // exactly which coins were picked
+                priceFilter:     `<= $${CONFIG.DYNAMIC.MAX_PRICE_FILTER}`,
+                volumeFilter:    `>= $${(CONFIG.DYNAMIC.MIN_24H_VOLUME_USD / 1_000_000).toFixed(0)}M 24h`,
+                cacheStatus:     screenerCache.isValid() ? 'cached' : 'fresh',
+                cacheExpiresInS: Math.max(0, Math.round((screenerCache.cachedAt + screenerCache.TTL_MS - Date.now()) / 1000)),
+            },
+        });
+
+    } catch (criticalDynamicErr) {
+        console.error(`[DynamicScreenerRouter/Critical] Core crash node:`, criticalDynamicErr.message);
+        res.status(500).json({ error: criticalDynamicErr.message });
+    }
+});
+
+// Single coin endpoint
 app.get('/api/signals/:coin', rateLimit, (req, res) => {
     const coin = req.params.coin?.toUpperCase();
     if (!coin || !/^[A-Z0-9]{2,10}$/.test(coin)) {
@@ -965,7 +1033,7 @@ app.get('/api/signals/:coin', rateLimit, (req, res) => {
     res.json(signal);
 });
 
-// Health check — for uptime monitors
+// Health check
 app.get('/api/health', (req, res) => {
     const ok = ['ok', 'degraded'].includes(marketIntelligenceState.engineStatus);
     res.status(ok ? 200 : 503).json({
@@ -992,12 +1060,11 @@ const server = app.listen(CONFIG.PORT, () => {
     console.log('╚═══════════════════════════════════════════╝');
     console.log(`[API]  Live on http://localhost:${CONFIG.PORT}`);
     console.log(`[API]  GET /api/signals         — Full scan results (default: 1h cached)`);
-    console.log(`[API]  GET /api/signals?timeframe=15m — On-demand timeframe scan`);
+    console.log(`[API]  GET /api/signals/dynamic — 🧠 REAL-TIME FULL MARKET VOL-SCREENER`);
     console.log(`[API]  GET /api/signals/:coin   — Single coin`);
     console.log(`[API]  GET /api/health          — Health check`);
 });
 
-// Graceful shutdown
 const shutdown = (sig) => {
     console.log(`\n[Server] ${sig} — shutting down gracefully`);
     server.close(() => { console.log('[Server] Closed.'); process.exit(0); });
@@ -1008,5 +1075,4 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 process.on('unhandledRejection', (reason) => {
     console.error('[Process] Unhandled rejection:', reason);
-    // Do NOT crash — log and continue
 });
