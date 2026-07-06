@@ -15,6 +15,15 @@ const CONFIG = {
     REFRESH_INTERVAL_MS: 30000, // 30s — respectful of rate limits
     PORT: 5000,
 
+    // ── 🔔 DISCORD WEBHOOK CONFIG ──
+    // Webhook URL kaise banayein:
+    // Discord Server → Channel Settings → Integrations → Webhooks → New Webhook → Copy URL
+    DISCORD: {
+        ENABLED:              true,               // Webhook URL set karne ke baad true karo
+        WEBHOOK_URL:          'https://discord.com/api/webhooks/1523642169221709904/mId9GmVMrtfQumYLcqtv4qormSl3EbVYnQNPyGZxql7BmtAfechgnioomCpxp5RXgBOZ',
+        MIN_CONFIDENCE_ALERT: 55,                  // 55% se kam confidence ka alert nahi aayega
+    },
+
     // ── 🔮 DYNAMIC ENGINE CONFIG MODULE ──
     DYNAMIC: {
         COIN_LIMIT: 6,           // Top 6 liquid coins to process on-the-fly
@@ -676,7 +685,110 @@ async function runDynamicVolumePriceScreener() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GLOBAL STATE — atomic, never half-written
+// DISCORD ALERT HELPER
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Last sent signal track karo — har 30s scan par same coin repeat alert na ho
+const discordState = {
+    lastBuyCoin:   null,
+    lastShortCoin: null,
+};
+
+async function sendDiscordAlert(payload) {
+    if (!CONFIG.DISCORD.ENABLED) return;
+    try {
+        const res = await fetch(CONFIG.DISCORD.WEBHOOK_URL, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify(payload),
+        });
+        if (!res.ok) {
+            const err = await res.text();
+            console.error('[Discord] Webhook error:', res.status, err);
+        } else {
+            console.log('[Discord] Alert sent ✓');
+        }
+    } catch (err) {
+        console.error('[Discord] Network error:', err.message);
+    }
+}
+
+function buildDiscordBuyPayload(signal) {
+    return {
+        username:   'QuantTrader Pro',
+        avatar_url: 'https://i.imgur.com/4M34hi2.png', // optional bot avatar
+        embeds: [{
+            title:       `⚡ LONG SIGNAL — ${signal.coin}/USDT`,
+            color:       0x00FF99, // green
+            description: `**Bullish confluence detected — entry opportunity**`,
+            fields: [
+                { name: '💰 Entry Price',   value: `$${signal.entry}`,               inline: true  },
+                { name: '🛑 Stop Loss',     value: `$${signal.stop_loss}`,            inline: true  },
+                { name: '📊 Confidence',    value: `**${signal.confidence}%**`,       inline: true  },
+                { name: '🎯 TP1',           value: `$${signal.take_profit[0]}`,       inline: true  },
+                { name: '🎯 TP2',           value: `$${signal.take_profit[1] ?? '—'}`, inline: true },
+                { name: '🎯 TP3',           value: `$${signal.take_profit[2] ?? '—'}`, inline: true },
+                { name: '⚖️ Risk:Reward',   value: signal.risk_reward,               inline: true  },
+                { name: '📈 Trend',         value: signal.trend,                     inline: true  },
+                { name: '💡 Reason',        value: signal.reasons[0] ?? 'Bullish confluence', inline: false },
+            ],
+            footer:    { text: 'QuantTrader Pro Signal Engine' },
+            timestamp: new Date().toISOString(),
+        }],
+    };
+}
+
+function buildDiscordShortPayload(signal) {
+    return {
+        username:   'QuantTrader Pro',
+        avatar_url: 'https://i.imgur.com/4M34hi2.png',
+        embeds: [{
+            title:       `🔻 SHORT SIGNAL — ${signal.coin}/USDT`,
+            color:       0xFF4444, // red
+            description: `**Bearish confluence detected — short opportunity**`,
+            fields: [
+                { name: '💰 Entry Price',   value: `$${signal.entry}`,               inline: true  },
+                { name: '🛑 Stop Loss',     value: `$${signal.stop_loss}`,            inline: true  },
+                { name: '📊 Confidence',    value: `**${signal.confidence}%**`,       inline: true  },
+                { name: '🎯 TP1',           value: `$${signal.take_profit[0]}`,       inline: true  },
+                { name: '🎯 TP2',           value: `$${signal.take_profit[1] ?? '—'}`, inline: true },
+                { name: '🎯 TP3',           value: `$${signal.take_profit[2] ?? '—'}`, inline: true },
+                { name: '⚖️ Risk:Reward',   value: signal.risk_reward,               inline: true  },
+                { name: '📉 Trend',         value: signal.trend,                     inline: true  },
+                { name: '💡 Reason',        value: signal.reasons[0] ?? 'Bearish confluence', inline: false },
+            ],
+            footer:    { text: 'QuantTrader Pro Signal Engine' },
+            timestamp: new Date().toISOString(),
+        }],
+    };
+}
+
+// ── Shared Discord Alert Dispatcher ──────────────────────────────────────
+// Alag function isliye — pipeline aur dynamic route dono yahi call karenge
+// Duplicate code nahi, ek jagah se dono routes ke alerts handle honge
+function processDiscordSignalAlert(primaryBuy, primaryShort) {
+    if (!CONFIG.DISCORD.ENABLED) return;
+
+    if (primaryBuy && primaryBuy.confidence >= CONFIG.DISCORD.MIN_CONFIDENCE_ALERT) {
+        if (primaryBuy.coin !== discordState.lastBuyCoin) {
+            discordState.lastBuyCoin = primaryBuy.coin;
+            sendDiscordAlert(buildDiscordBuyPayload(primaryBuy)); // fire-and-forget
+        }
+    } else if (!primaryBuy) {
+        discordState.lastBuyCoin = null;
+    }
+
+    if (primaryShort && primaryShort.confidence >= CONFIG.DISCORD.MIN_CONFIDENCE_ALERT) {
+        if (primaryShort.coin !== discordState.lastShortCoin) {
+            discordState.lastShortCoin = primaryShort.coin;
+            sendDiscordAlert(buildDiscordShortPayload(primaryShort)); // fire-and-forget
+        }
+    } else if (!primaryShort) {
+        discordState.lastShortCoin = null;
+    }
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 let marketIntelligenceState = {
@@ -798,6 +910,9 @@ async function coreMarketIntelligencePipeline() {
 
         const dur = Date.now() - startTime;
         console.log(`[Pipeline] Scan complete in ${dur}ms | Trend: ${activeTrend} | ${freshSignals.length}/${CONFIG.TARGET_COINS.length} coins`);
+
+        // ── Discord alerts — shared dispatcher ───────────────────────────
+        processDiscordSignalAlert(primaryBuy, primaryShort);
 
     } catch (criticalErr) {
         console.error('[Pipeline] Critical error:', criticalErr.message);
@@ -992,6 +1107,10 @@ app.get('/api/signals/dynamic', rateLimit, async (req, res) => {
             if (buyMargin >= shortMargin) primaryShort = shortSorted[1] ?? null;
             else primaryBuy = longSorted[1] ?? null;
         }
+
+        // ── Dynamic route Discord dispatch ───────────────────────────────
+        // Same shared function — sub-$1 coins ke signals bhi Discord par jayenge
+        processDiscordSignalAlert(primaryBuy, primaryShort);
 
         // Return pristine layout structures matching your core UI state expectation maps
         return res.json({
