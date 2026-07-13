@@ -2,6 +2,14 @@ import express from 'express';
 import cors from 'cors';
 import ccxt from 'ccxt';
 import pkg from 'technicalindicators';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createHmac, timingSafeEqual } from 'crypto';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const { RSI, MACD, EMA, BollingerBands, ATR, StochasticRSI } = pkg;
 
@@ -26,9 +34,10 @@ const CONFIG = {
 
     // ── 🔮 DYNAMIC ENGINE CONFIG MODULE ──
     DYNAMIC: {
-        COIN_LIMIT: 6,           // Top 6 liquid coins to process on-the-fly
-        MAX_PRICE_FILTER: 1.0,   // Strict sub-$1 boundary filter
-        MIN_24H_VOLUME_USD: 5000000, // Trigger scan only on coins with > $5M volume
+        COIN_LIMIT: 6,                  // Top 6 liquid coins to process on-the-fly
+        MAX_PRICE_FILTER: 1.0,          // Strict sub-$1 boundary filter
+        MIN_24H_VOLUME_USD: 5000000,    // Trigger scan only on coins with > $5M volume
+        SCREENER_INTERVAL_MS: 120000,   // Autonomous background scan — har 2 minute
     },
 
     // Scoring weights — total = 100
@@ -64,6 +73,80 @@ const CONFIG = {
         PAUSE_MS: 120000, // 2 min cooldown
     },
 };
+
+const AUTH_CONFIG = {
+    ADMIN_EMAIL: process.env.ADMIN_EMAIL?.trim() || '',
+    ADMIN_USERNAME: process.env.ADMIN_USERNAME?.trim() || '',
+    ADMIN_PASSWORD: process.env.ADMIN_PASSWORD?.trim() || '',
+    SECRET: process.env.AUTH_SECRET?.trim() || 'dev-auth-secret-change-me',
+    SESSION_TTL_MS: Number(process.env.AUTH_SESSION_TTL_MS || 8 * 60 * 60 * 1000),
+    COOKIE_NAME: 'quant_session',
+};
+
+function toBase64Url(value) {
+    return Buffer.from(value).toString('base64url');
+}
+
+function fromBase64Url(value) {
+    return Buffer.from(value, 'base64url').toString('utf8');
+}
+
+function createSessionToken(sessionPayload, ttlMs) {
+    const header = toBase64Url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+    const body = toBase64Url(JSON.stringify({ ...sessionPayload, exp: Date.now() + ttlMs }));
+    const signature = createHmac('sha256', AUTH_CONFIG.SECRET).update(`${header}.${body}`).digest('base64url');
+    return `${header}.${body}.${signature}`;
+}
+
+function verifySessionToken(token) {
+    if (typeof token !== 'string') return null;
+
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+
+    const [header, payload, signature] = parts;
+    const expectedSignature = createHmac('sha256', AUTH_CONFIG.SECRET).update(`${header}.${payload}`).digest('base64url');
+    const expectedBuffer = Buffer.from(expectedSignature);
+    const actualBuffer = Buffer.from(signature);
+
+    if (expectedBuffer.length !== actualBuffer.length) return null;
+
+    try {
+        timingSafeEqual(expectedBuffer, actualBuffer);
+    } catch {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(fromBase64Url(payload));
+        if (!parsed.exp || Date.now() > parsed.exp) return null;
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
+function parseCookies(req) {
+    const header = req.headers.cookie ?? '';
+    return header.split(';').map((segment) => segment.trim()).filter(Boolean).reduce((acc, entry) => {
+        const separatorIndex = entry.indexOf('=');
+        if (separatorIndex === -1) return acc;
+        const key = decodeURIComponent(entry.slice(0, separatorIndex));
+        const value = decodeURIComponent(entry.slice(separatorIndex + 1));
+        acc[key] = value;
+        return acc;
+    }, {});
+}
+
+function setSessionCookie(res, token, ttlMs) {
+    const cookieValue = `${AUTH_CONFIG.COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; Path=/; Max-Age=${Math.floor(ttlMs / 1000)}; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
+    res.setHeader('Set-Cookie', cookieValue);
+}
+
+function clearSessionCookie(res) {
+    const cookieValue = `${AUTH_CONFIG.COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
+    res.setHeader('Set-Cookie', cookieValue);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EXCHANGE — rate limit safe, timeout set
@@ -689,9 +772,17 @@ async function runDynamicVolumePriceScreener() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Last sent signal track karo — har 30s scan par same coin repeat alert na ho
+// Discord duplicate guard — 3-layer protection:
+// Layer 1: same coin track — dobara nahi bhejega jab tak coin na badle
+// Layer 2: 10 min cooldown — same coin teen alag sources se bhi spam nahi hoga
+// Layer 3: source label — Discord footer mein dikh sake kahan se aaya
+// 🛡️ MULTI-COIN MAP MATRIX — har coin ka apna independent cooldown timer
+// Pehle: single variable (lastBuyCoin/lastShortCoin) — LAB ne SOL ka state overwrite kar diya
+// Ab: har coin ki apni entry — SOL, LAB, PEPE sab alag alag track honge
 const discordState = {
-    lastBuyCoin:   null,
-    lastShortCoin: null,
+    buySignals:  {},  // { 'SOL': timestamp, 'LAB': timestamp, 'PEPE': timestamp }
+    shortSignals: {}, // { 'SOL': timestamp, 'LAB': timestamp }
+    COOLDOWN_MS:  10 * 60 * 1000, // 10 minutes — per-coin independent lock
 };
 
 async function sendDiscordAlert(payload) {
@@ -713,7 +804,7 @@ async function sendDiscordAlert(payload) {
     }
 }
 
-function buildDiscordBuyPayload(signal) {
+function buildDiscordBuyPayload(signal, source = 'Pipeline') {
     return {
         username:   'QuantTrader Pro',
         avatar_url: 'https://i.imgur.com/4M34hi2.png', // optional bot avatar
@@ -732,13 +823,13 @@ function buildDiscordBuyPayload(signal) {
                 { name: '📈 Trend',         value: signal.trend,                     inline: true  },
                 { name: '💡 Reason',        value: signal.reasons[0] ?? 'Bullish confluence', inline: false },
             ],
-            footer:    { text: 'QuantTrader Pro Signal Engine' },
+            footer:    { text: `QuantTrader Pro • ${source}` },
             timestamp: new Date().toISOString(),
         }],
     };
 }
 
-function buildDiscordShortPayload(signal) {
+function buildDiscordShortPayload(signal, source = 'Pipeline') {
     return {
         username:   'QuantTrader Pro',
         avatar_url: 'https://i.imgur.com/4M34hi2.png',
@@ -757,34 +848,50 @@ function buildDiscordShortPayload(signal) {
                 { name: '📉 Trend',         value: signal.trend,                     inline: true  },
                 { name: '💡 Reason',        value: signal.reasons[0] ?? 'Bearish confluence', inline: false },
             ],
-            footer:    { text: 'QuantTrader Pro Signal Engine' },
+            footer:    { text: `QuantTrader Pro • ${source}` },
             timestamp: new Date().toISOString(),
         }],
     };
 }
 
 // ── Shared Discord Alert Dispatcher ──────────────────────────────────────
-// Alag function isliye — pipeline aur dynamic route dono yahi call karenge
-// Duplicate code nahi, ek jagah se dono routes ke alerts handle honge
-function processDiscordSignalAlert(primaryBuy, primaryShort) {
+// Multi-Coin Map Matrix — har coin apna alag cooldown rakhta hai
+// SOL ka timer LAB se, LAB ka timer PEPE se kabhi overwrite nahi hoga
+function processDiscordSignalAlert(primaryBuy, primaryShort, source = 'Pipeline') {
     if (!CONFIG.DISCORD.ENABLED) return;
 
+    const now = Date.now();
+
+    // 🟢 BUY guard — per-coin independent check
     if (primaryBuy && primaryBuy.confidence >= CONFIG.DISCORD.MIN_CONFIDENCE_ALERT) {
-        if (primaryBuy.coin !== discordState.lastBuyCoin) {
-            discordState.lastBuyCoin = primaryBuy.coin;
-            sendDiscordAlert(buildDiscordBuyPayload(primaryBuy)); // fire-and-forget
+        const coin       = primaryBuy.coin;
+        const lastSentAt = discordState.buySignals[coin] || 0;
+        const cooldownOver = (now - lastSentAt) >= discordState.COOLDOWN_MS;
+
+        if (cooldownOver) {
+            discordState.buySignals[coin] = now; // sirf is coin ka timer update
+            sendDiscordAlert(buildDiscordBuyPayload(primaryBuy, source));
+            console.log(`[Discord] BUY alert sent — ${coin} | Source: ${source}`);
+        } else {
+            const remainSec = Math.round((discordState.COOLDOWN_MS - (now - lastSentAt)) / 1000);
+            console.log(`[Discord] BUY duplicate blocked — ${coin} already sent. Cooldown: ${remainSec}s remaining`);
         }
-    } else if (!primaryBuy) {
-        discordState.lastBuyCoin = null;
     }
 
+    // 🔴 SHORT guard — per-coin independent check
     if (primaryShort && primaryShort.confidence >= CONFIG.DISCORD.MIN_CONFIDENCE_ALERT) {
-        if (primaryShort.coin !== discordState.lastShortCoin) {
-            discordState.lastShortCoin = primaryShort.coin;
-            sendDiscordAlert(buildDiscordShortPayload(primaryShort)); // fire-and-forget
+        const coin       = primaryShort.coin;
+        const lastSentAt = discordState.shortSignals[coin] || 0;
+        const cooldownOver = (now - lastSentAt) >= discordState.COOLDOWN_MS;
+
+        if (cooldownOver) {
+            discordState.shortSignals[coin] = now; // sirf is coin ka timer update
+            sendDiscordAlert(buildDiscordShortPayload(primaryShort, source));
+            console.log(`[Discord] SHORT alert sent — ${coin} | Source: ${source}`);
+        } else {
+            const remainSec = Math.round((discordState.COOLDOWN_MS - (now - lastSentAt)) / 1000);
+            console.log(`[Discord] SHORT duplicate blocked — ${coin} already sent. Cooldown: ${remainSec}s remaining`);
         }
-    } else if (!primaryShort) {
-        discordState.lastShortCoin = null;
     }
 }
 
@@ -912,7 +1019,7 @@ async function coreMarketIntelligencePipeline() {
         console.log(`[Pipeline] Scan complete in ${dur}ms | Trend: ${activeTrend} | ${freshSignals.length}/${CONFIG.TARGET_COINS.length} coins`);
 
         // ── Discord alerts — shared dispatcher ───────────────────────────
-        processDiscordSignalAlert(primaryBuy, primaryShort);
+        processDiscordSignalAlert(primaryBuy, primaryShort, 'Robot1 • Major Coins 30s');
 
     } catch (criticalErr) {
         console.error('[Pipeline] Critical error:', criticalErr.message);
@@ -927,7 +1034,67 @@ function scheduleNext() {
     setTimeout(coreMarketIntelligencePipeline, CONFIG.REFRESH_INTERVAL_MS);
 }
 
-coreMarketIntelligencePipeline();
+// ─────────────────────────────────────────────────────────────────────────────
+// 🤖 AUTONOMOUS BACKGROUND DYNAMIC SCREENER PIPELINE (WEBSITE-INDEPENDENT)
+// Frontend band ho ya chalu — yeh robot har 2 minute baad khud chalta rahega
+// aur sub-$1 high-volume coins scan karke signals Discord par push karega
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function autonomousDynamicScreenerPipeline() {
+    console.log('\n[AutonomousScreener] 🤖 Running scheduled full-market scan...');
+    try {
+        const fluidTargetWatchlist = await runDynamicVolumePriceScreener();
+
+        const freshSignals = [];
+        const freshErrors  = {};
+
+        for (const symbol of fluidTargetWatchlist) {
+            try {
+                const signal = await processAssetIntelligence(symbol, '1h');
+                freshSignals.push(signal);
+                console.log(`  [AutonomousScreener] ✓ ${signal.coin.padEnd(6)} | ${signal.action.padEnd(5)} | Conf: ${signal.confidence}%`);
+            } catch (err) {
+                const coin = symbol.split('/')[0];
+                freshErrors[coin] = err.message;
+                console.error(`  [AutonomousScreener] ✗ ${coin}: ${err.message}`);
+            }
+        }
+
+        if (freshSignals.length === 0) {
+            console.warn('[AutonomousScreener] All coins failed this cycle — skipping Discord dispatch.');
+            return;
+        }
+
+        const longSorted  = freshSignals.filter(s => s.action === 'BUY').sort((a, b) => b.confidence - a.confidence);
+        const shortSorted = freshSignals.filter(s => s.action === 'SELL').sort((a, b) => b.confidence - a.confidence);
+
+        let primaryBuy   = longSorted[0]  ?? null;
+        let primaryShort = shortSorted[0] ?? null;
+
+        if (primaryBuy && primaryShort && primaryBuy.coin === primaryShort.coin) {
+            const buyMargin   = primaryBuy.confidence   - (longSorted[1]?.confidence  ?? 0);
+            const shortMargin = primaryShort.confidence - (shortSorted[1]?.confidence ?? 0);
+            if (buyMargin >= shortMargin) primaryShort = shortSorted[1] ?? null;
+            else                          primaryBuy   = longSorted[1]  ?? null;
+        }
+
+        if (primaryBuy || primaryShort) {
+            console.log(`[AutonomousScreener] Signal found — dispatching to Discord...`);
+            processDiscordSignalAlert(primaryBuy, primaryShort, 'Robot2 • Sub-$1 Scanner 2min');
+        } else {
+            console.log(`[AutonomousScreener] No coin met minimum thresholds — no alert sent.`);
+        }
+
+    } catch (criticalErr) {
+        console.error('[AutonomousScreener] Critical cycle failure:', criticalErr.message);
+    } finally {
+        setTimeout(autonomousDynamicScreenerPipeline, CONFIG.DYNAMIC.SCREENER_INTERVAL_MS);
+    }
+}
+
+// ── BOOT: Dono pipelines simultaneously start honge ──
+coreMarketIntelligencePipeline();       // Robot 1: Major coins (BTC/ETH/SOL) — har 30s
+autonomousDynamicScreenerPipeline();    // Robot 2: Sub-$1 full market scanner — har 2 min
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SIMPLE IN-MEMORY RATE LIMITER
@@ -968,13 +1135,86 @@ app.use((req, res, next) => {
     next();
 });
 
+app.use(express.json({ limit: '200kb' }));
 app.use(cors({
-    origin: process.env.ALLOWED_ORIGINS ?? '*',
-    methods: ['GET'],
+    origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map((entry) => entry.trim()).filter(Boolean) : ['http://localhost:5173', 'http://127.0.0.1:5173'],
+    credentials: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
 }));
 
 const VALID_TIMEFRAMES = ['5m', '15m', '30m', '1h', '4h', '1d'];
 const DEFAULT_TIMEFRAME = '1h';
+
+const loginAttempts = new Map();
+function loginRateLimit(req, res, next) {
+    const ip = req.ip ?? 'unknown';
+    const now = Date.now();
+    const current = loginAttempts.get(ip);
+
+    if (!current || now > current.resetAt) {
+        loginAttempts.set(ip, { count: 1, resetAt: now + 15 * 60 * 1000 });
+        return next();
+    }
+
+    current.count += 1;
+    if (current.count > 10) {
+        return res.status(429).json({ message: 'Too many login attempts. Please try again shortly.' });
+    }
+
+    next();
+}
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, record] of loginAttempts.entries()) {
+        if (now > record.resetAt) loginAttempts.delete(ip);
+    }
+}, 15 * 60 * 1000);
+
+app.post('/api/auth/login', loginRateLimit, (req, res) => {
+    const identifier = typeof req.body?.identifier === 'string' ? req.body.identifier.trim() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const rememberMe = Boolean(req.body?.rememberMe);
+
+    if (!identifier || !password) {
+        return res.status(400).json({ message: 'Invalid email or password.' });
+    }
+
+    if (!AUTH_CONFIG.ADMIN_EMAIL || !AUTH_CONFIG.ADMIN_PASSWORD) {
+        return res.status(503).json({ message: 'Authentication is not configured on the server.' });
+    }
+
+    const normalizedIdentifier = identifier.toLowerCase();
+    const normalizedEmail = AUTH_CONFIG.ADMIN_EMAIL.toLowerCase();
+    const normalizedUsername = AUTH_CONFIG.ADMIN_USERNAME.toLowerCase();
+    const validCredentials = normalizedIdentifier === normalizedEmail || normalizedIdentifier === normalizedUsername;
+
+    if (!validCredentials || password !== AUTH_CONFIG.ADMIN_PASSWORD) {
+        return res.status(401).json({ message: 'Invalid email or password.' });
+    }
+
+    const ttlMs = rememberMe ? AUTH_CONFIG.SESSION_TTL_MS : Math.min(60 * 60 * 1000, AUTH_CONFIG.SESSION_TTL_MS);
+    const token = createSessionToken({ user: { email: AUTH_CONFIG.ADMIN_EMAIL, username: AUTH_CONFIG.ADMIN_USERNAME || AUTH_CONFIG.ADMIN_EMAIL }, rememberMe }, ttlMs);
+    setSessionCookie(res, token, ttlMs);
+
+    return res.json({ ok: true, message: 'Authentication successful.' });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    clearSessionCookie(res);
+    return res.json({ ok: true, message: 'Signed out.' });
+});
+
+app.get('/api/auth/me', (req, res) => {
+    const cookies = parseCookies(req);
+    const session = verifySessionToken(cookies[AUTH_CONFIG.COOKIE_NAME]);
+
+    if (!session) {
+        return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    return res.json({ ok: true, user: session.user });
+});
 
 // ── ENDPOINT 1: STATIC/STANDARD WATCHLIST SIGNALS (UNTOUCHED 🟢)
 app.get('/api/signals', rateLimit, async (req, res) => {
@@ -1110,7 +1350,7 @@ app.get('/api/signals/dynamic', rateLimit, async (req, res) => {
 
         // ── Dynamic route Discord dispatch ───────────────────────────────
         // Same shared function — sub-$1 coins ke signals bhi Discord par jayenge
-        processDiscordSignalAlert(primaryBuy, primaryShort);
+        processDiscordSignalAlert(primaryBuy, primaryShort, 'API • Dynamic Route');
 
         // Return pristine layout structures matching your core UI state expectation maps
         return res.json({
